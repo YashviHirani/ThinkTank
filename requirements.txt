@@ -1,7 +1,6 @@
 # Amazon ML Challenge 2026 — ThinkTank Requirements
-# Pinned dependencies for reproducible execution
-lightgbm==4.7.0
-rapidfuzz==3.14.6
-scikit-learn==1.9.0
-pandas==3.0.2
-numpy==2.4.4
+pandas>=2.0.0
+numpy>=1.24.0
+lightgbm>=4.0.0
+rapidfuzz>=3.0.0
+scikit-learn>=1.2.0

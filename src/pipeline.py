@@ -1,375 +1,480 @@
 """
-Phase 1, Step 5.4: End-to-End Baseline Pipeline Orchestrator
-============================================================
-Connects data loading, normalization, inverted-index blocking, feature extraction,
-LightGBM training, grouped macro F0.5 threshold tuning, test prediction, TSV generation,
-and submission validation.
+Entity Resolution Pipeline — Amazon ML Challenge 2026
+======================================================
+End-to-end orchestration: load → normalise → block → features → train → predict → output.
+
+Run modes
+---------
+  python src/pipeline.py --mode train_val
+      Full pipeline on train/val split. Measures blocking recall, trains model,
+      tunes threshold, reports local grouped macro F0.5.
+
+  python src/pipeline.py --mode submission
+      Full pipeline: train on ALL training data, generate test submission files.
+
+  python src/pipeline.py --mode phase2_blocking
+      Phase 2 blocking experiment sweep (K sweep + key combination analysis).
+
+  python src/pipeline.py --mode phase1_dryrun
+      Phase 1 fast baseline dry-run verification.
+
+Optional flags
+--------------
+  --K           20      Top-K cap for candidate generation
+  --spw         3.0     LightGBM scale_pos_weight
+  --no-train          Skip training, load cached model
+  --model-path        Path to cached model (for --no-train)
 
 Usage:
-    # Quick dry-run sanity check on sample data:
-    python src/pipeline.py --dry-run
-
-    # Full training and submission generation:
-    python src/pipeline.py --full
+    python src/pipeline.py --mode train_val
+    python src/pipeline.py --mode submission --K 20
 """
 
 import os
 import sys
+import json
 import time
-import argparse
 import pickle
+import argparse
 import csv
-from datetime import datetime, timezone
-from typing import Dict, List, Set, Tuple, Any
-
-# Ensure project root is in path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-
-from src.normalizer import (
-    normalize_general_text,
-    extract_core_name,
-    get_sorted_tokens,
-    normalize_address,
-    extract_numeric_tokens,
-    extract_postcode_candidate,
-)
-from src.blocker import (
-    InvertedIndex,
-    generate_candidate_pairs,
-    evaluate_blocking_recall,
-)
-from src.features import compute_features_for_pairs, FEATURE_NAMES
-from src.model import (
-    build_training_pairs,
-    train_lgbm_classifier,
-    tune_prediction_threshold,
-)
-from src.scorer import macro_f05
-from utils.validate_submission import validate_submission
-
+from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATASET_DIR = os.path.join(BASE_DIR, "dataset")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-EXPERIMENTS_DIR = os.path.join(BASE_DIR, "experiments")
+sys.path.insert(0, BASE_DIR)
 
-LOG_FILE = os.path.join(EXPERIMENTS_DIR, "submission_log.csv")
+from src.data_loader import load_all_data
+from src.normaliser import normalise_df
+from src.blocker import BlockingIndex, blocking_stats
+from src.feature_extractor import build_feature_matrix, FEATURE_NAMES
+from src.trainer import train_and_evaluate, predict, tune_threshold
+from src.output_writer import write_outputs
+from src.scorer import macro_f05
 
+EXPERIMENTS_DIR = os.path.join(BASE_DIR, 'experiments')
+MODELS_DIR      = os.path.join(BASE_DIR, 'models')
+OUTPUT_DIR      = os.path.join(BASE_DIR, 'output')
 
-# ---------------------------------------------------------------------------
-# Helper: Fast Record Normalisation Cache
-# ---------------------------------------------------------------------------
+os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def build_normalized_records_dict(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    """
-    Builds a fast lookup dictionary of normalized entity attributes.
-    Key: entity_id -> dict of normalized views.
-    """
-    records = {}
-    ids = df["entity_id"].values
-    names = df["business_name"].fillna("").values
-    addrs = df["business_address"].fillna("").values
-    countries = df["country"].fillna("").str.strip().str.upper().values
-
-    for i in range(len(df)):
-        clean_n = normalize_general_text(names[i])
-        cn, suf = extract_core_name(clean_n)
-        clean_a = normalize_address(addrs[i])
-        nums = extract_numeric_tokens(clean_a)
-        pc = extract_postcode_candidate(clean_a)
-
-        records[ids[i]] = {
-            "core_name": cn,
-            "legal_suffix": suf,
-            "sorted_name": get_sorted_tokens(cn),
-            "clean_address": clean_a,
-            "numeric_tokens": nums,
-            "postcode": pc,
-            "country": countries[i],
-        }
-    return records
+SUBMISSION_LOG = os.path.join(EXPERIMENTS_DIR, 'submission_log.csv')
 
 
 # ---------------------------------------------------------------------------
-# Logging Function
+# Load split IDs
 # ---------------------------------------------------------------------------
 
-def log_submission_entry(
-    submission_name: str,
-    threshold: float,
-    val_f05: float,
-    status: str,
-    notes: str = "",
-):
-    """Appends submission metadata to experiments/submission_log.csv."""
-    os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
-    file_exists = os.path.exists(LOG_FILE)
-
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "timestamp", "submission_name", "threshold", "val_macro_f05", "status", "notes"
-            ])
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(),
-            submission_name,
-            f"{threshold:.2f}",
-            f"{val_f05:.4f}",
-            status,
-            notes,
-        ])
-    print(f"  Recorded in {LOG_FILE}")
+def load_split_ids():
+    train_path = os.path.join(EXPERIMENTS_DIR, 'train_s1_ids.txt')
+    val_path   = os.path.join(EXPERIMENTS_DIR, 'val_s1_ids.txt')
+    with open(train_path) as f:
+        train_ids = set(f.read().splitlines())
+    with open(val_path) as f:
+        val_ids = set(f.read().splitlines())
+    return train_ids, val_ids
 
 
 # ---------------------------------------------------------------------------
-# Pipeline Orchestrator
+# Normalise all DataFrames
 # ---------------------------------------------------------------------------
 
-def run_pipeline(
-    dry_run: bool = False,
-    sample_size: Optional[int] = None,
-    top_k: int = 20,
-):
-    t_start = time.time()
-    print("=" * 65)
-    print("  Amazon ML Challenge 2026 — Baseline Pipeline Run")
-    mode = "DRY-RUN (Sample)" if dry_run else "FULL RUN"
-    print(f"  Mode: {mode}")
-    print("=" * 65)
+def normalise_all(data: dict) -> dict:
+    print("\n--- Normalising DataFrames ---")
+    t0 = time.time()
+    norm = {}
+    for key in ['train_s1', 'train_s2', 'train_s3', 'test_s1', 'test_s2', 'test_s3']:
+        print(f"  Normalising {key}...", flush=True)
+        norm[key] = normalise_df(data[key])
+    print(f"  Normalisation complete in {time.time()-t0:.1f}s")
+    return norm
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 1. Load Data
-    # ------------------------------------------------------------------
-    print("\n[Step 1/6] Loading source data...")
+# ---------------------------------------------------------------------------
+# Build lookup dicts from normalised DFs
+# ---------------------------------------------------------------------------
 
-    train_dir = os.path.join(DATASET_DIR, "train")
-    test_dir = os.path.join(DATASET_DIR, "test")
+def build_lookup(df: pd.DataFrame) -> dict:
+    """entity_id → row dict. Vectorized — avoids iterrows on large DFs."""
+    records = df.to_dict('records')
+    return {r['entity_id']: r for r in records}
 
-    nrows_target = 25000 if dry_run else (sample_size or None)
-    nrows_s1 = 2000 if dry_run else (sample_size or None)
 
-    if dry_run:
-        print(f"  Sampling {nrows_target:,} target rows from S2 and S3...")
-        train_s2 = pd.read_csv(os.path.join(train_dir, "train_source2.tsv"), sep="\t", dtype=str, nrows=nrows_target)
-        train_s3 = pd.read_csv(os.path.join(train_dir, "train_source3.tsv"), sep="\t", dtype=str, nrows=nrows_target)
-        train_targets_df = pd.concat([train_s2, train_s3], ignore_index=True)
-        target_ids_set = set(train_targets_df["entity_id"])
+# ---------------------------------------------------------------------------
+# TRAIN_VAL mode: validate full pipeline on train/val split
+# ---------------------------------------------------------------------------
 
-        print("  Finding S1 entities that match sample targets...")
-        gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, nrows=60000)
-        gt_matches = {}
-        matched_s1_ids = []
-        for _, r in gt_df.iterrows():
-            val = str(r["matched_entity_ids"]).strip()
-            m_set = set(x.strip() for x in val.split(",") if x.strip()) if val and val != "nan" else set()
-            valid_m = m_set & target_ids_set
-            s1_id = r["source1_entity_id"]
-            if valid_m:
-                gt_matches[s1_id] = valid_m
-                matched_s1_ids.append(s1_id)
-            elif len(matched_s1_ids) < nrows_s1 // 10 and len(m_set) == 0:  # add singletons
-                gt_matches[s1_id] = set()
-                matched_s1_ids.append(s1_id)
-            if len(matched_s1_ids) >= nrows_s1:
-                break
+def run_train_val(K: int = 20, spw: float = 3.0, no_train: bool = False, model_path: str = None):
+    t_total = time.time()
 
-        print(f"    Selected {len(matched_s1_ids):,} S1 entities for dry-run.")
-        s1_needed = set(matched_s1_ids)
-        s1_chunks = []
-        for chunk in pd.read_csv(os.path.join(train_dir, "train_source1.tsv"), sep="\t", dtype=str, chunksize=50000):
-            hit = chunk[chunk["entity_id"].isin(s1_needed)]
-            if len(hit) > 0:
-                s1_chunks.append(hit)
-                s1_needed -= set(hit["entity_id"])
-            if not s1_needed:
-                break
-        train_s1 = pd.concat(s1_chunks, ignore_index=True) if s1_chunks else pd.DataFrame()
-    else:
-        print(f"  Loading train sources (nrows_target={nrows_target}, nrows_s1={nrows_s1})...")
-        train_s2 = pd.read_csv(os.path.join(train_dir, "train_source2.tsv"), sep="\t", dtype=str, nrows=nrows_target)
-        train_s3 = pd.read_csv(os.path.join(train_dir, "train_source3.tsv"), sep="\t", dtype=str, nrows=nrows_target)
-        train_targets_df = pd.concat([train_s2, train_s3], ignore_index=True)
-        train_s1 = pd.read_csv(os.path.join(train_dir, "train_source1.tsv"), sep="\t", dtype=str, nrows=nrows_s1)
+    print("\n" + "="*60)
+    print("  TRAIN_VAL MODE")
+    print("="*60)
 
-        print("  Loading ground truth...")
-        gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, nrows=nrows_s1 * 3 if nrows_s1 else None)
-        gt_matches = {}
-        for _, r in gt_df.iterrows():
-            val = str(r["matched_entity_ids"]).strip()
-            gt_matches[r["source1_entity_id"]] = set(x.strip() for x in val.split(",") if x.strip()) if val and val != "nan" else set()
+    # 1. Load data
+    print("\n--- Loading data ---")
+    data = load_all_data()
+    gt_matches = data['gt_matches']
 
-    # Normalize records dictionaries
-    print("  Building normalized attribute caches...")
-    s1_dict = build_normalized_records_dict(train_s1)
-    target_dict = build_normalized_records_dict(train_targets_df)
+    # 2. Load split
+    train_ids, val_ids = load_split_ids()
+    print(f"  Train S1 IDs: {len(train_ids):,} | Val S1 IDs: {len(val_ids):,}")
 
-    # ------------------------------------------------------------------
-    # 2. Inverted Index Blocking on Training Targets
-    # ------------------------------------------------------------------
-    print("\n[Step 2/6] Building inverted index on training targets...")
-    train_index = InvertedIndex(max_bucket_size=500)
-    train_index.build_from_dataframe(train_targets_df)
+    # 3. Normalise
+    norm = normalise_all(data)
 
-    print(f"  Generating candidate pairs for training S1 entities (Top-K={top_k})...")
-    train_candidates = generate_candidate_pairs(train_s1, train_index, top_k=top_k)
+    # Build lookups
+    train_s2_dict = build_lookup(norm['train_s2'])
+    train_s3_dict = build_lookup(norm['train_s3'])
+    target_dict   = {**train_s2_dict, **train_s3_dict}
 
-    # Evaluate blocking recall
-    eval_res = evaluate_blocking_recall(train_candidates, gt_matches, verbose=True)
+    train_s1_df = norm['train_s1'][norm['train_s1']['entity_id'].isin(train_ids)].reset_index(drop=True)
+    val_s1_df   = norm['train_s1'][norm['train_s1']['entity_id'].isin(val_ids)].reset_index(drop=True)
 
-    # ------------------------------------------------------------------
-    # 3. Feature Extraction & LightGBM Model Training
-    # ------------------------------------------------------------------
-    print("\n[Step 3/6] Assembling labeled pairs & computing features...")
-    train_pairs, y_train = build_training_pairs(train_candidates, gt_matches, max_negatives_per_positive=4)
-    print(f"  Extracted {len(train_pairs):,} labeled pairs (Positives: {(y_train==1).sum():,}, Negatives: {(y_train==0).sum():,})")
+    train_s1_dict = build_lookup(train_s1_df)
+    val_s1_dict   = build_lookup(val_s1_df)
 
-    X_train = compute_features_for_pairs(train_pairs, s1_dict, target_dict)
+    # 4. Block
+    print("\n--- Blocking (train+val S2+S3) ---")
+    idx = BlockingIndex(norm['train_s2'], norm['train_s3'])
 
-    # Split for threshold tuning
-    n_total = len(X_train)
-    val_split_idx = int(n_total * 0.8)
-    X_tr, y_tr = X_train[:val_split_idx], y_train[:val_split_idx]
-    X_vl, y_vl = X_train[val_split_idx:], y_train[val_split_idx:]
-    pairs_val = train_pairs[val_split_idx:]
+    print("\n  Retrieving candidates for TRAIN split...")
+    train_candidates = idx.retrieve(train_s1_df, K=K)
 
-    print("\n  Training LightGBM classifier...")
-    model = train_lgbm_classifier(X_tr, y_tr, X_vl, y_vl, n_estimators=100)
+    print("\n  Retrieving candidates for VAL split...")
+    val_candidates = idx.retrieve(val_s1_df, K=K)
 
-    # Save model
-    model_path = os.path.join(MODELS_DIR, "baseline_lgbm.pkl")
-    with open(model_path, "wb") as f:
-        pickle.dump(model, f)
-    print(f"  Model saved to {model_path}")
+    # Blocking recall on val
+    val_blocking = blocking_stats(val_candidates, gt_matches, val_ids)
+    print(f"\n  Val blocking stats: {val_blocking}")
 
-    # ------------------------------------------------------------------
-    # 4. Threshold Tuning on Grouped Validation Pairs
-    # ------------------------------------------------------------------
-    print("\n[Step 4/6] Tuning probability threshold for Macro F0.5...")
-    val_probs = model.predict_proba(X_vl)[:, 1]
+    # 5. Feature extraction
+    print("\n--- Building feature matrices ---")
+    t_feat = time.time()
 
-    val_pair_probs = {(p[0], p[1]): float(prob) for p, prob in zip(pairs_val, val_probs)}
-    val_s1_unique = list(set(p[0] for p in pairs_val))
-
-    best_thresh, best_val_f05, _ = tune_prediction_threshold(
-        val_s1_unique, train_candidates, val_pair_probs, gt_matches, verbose=True
+    print("  Train pairs...")
+    X_train, y_train, train_pair_ids = build_feature_matrix(
+        train_candidates, train_s1_dict, target_dict, gt_matches
     )
+    print(f"  Train: {len(X_train):,} pairs, {y_train.sum():,} positives")
 
-    # ------------------------------------------------------------------
-    # 5. Generate Test Candidates & Predictions
-    # ------------------------------------------------------------------
-    print("\n[Step 5/6] Generating Test Set Submissions...")
+    print("  Val pairs...")
+    X_val, y_val, val_pair_ids = build_feature_matrix(
+        val_candidates, val_s1_dict, target_dict, gt_matches
+    )
+    print(f"  Val: {len(X_val):,} pairs, {y_val.sum():,} positives")
+    print(f"  Feature extraction: {time.time()-t_feat:.1f}s")
 
-    test_s1_path = os.path.join(test_dir, "test_source1.tsv")
-    test_s2_path = os.path.join(test_dir, "test_source2.tsv")
-    test_s3_path = os.path.join(test_dir, "test_source3.tsv")
+    # 6. Train
+    if not no_train:
+        model_out  = os.path.join(MODELS_DIR, 'lgbm_model.pkl')
+        thresh_out = os.path.join(MODELS_DIR, 'threshold.json')
 
-    print(f"  Loading test entities...")
-    test_s1_df = pd.read_csv(test_s1_path, sep="\t", dtype=str, nrows=nrows_s1)
-    test_s2_df = pd.read_csv(test_s2_path, sep="\t", dtype=str, nrows=nrows_target)
-    test_s3_df = pd.read_csv(test_s3_path, sep="\t", dtype=str, nrows=nrows_target)
-    test_targets_df = pd.concat([test_s2_df, test_s3_df], ignore_index=True)
-
-    print("  Building test inverted index...")
-    test_index = InvertedIndex(max_bucket_size=500)
-    test_index.build_from_dataframe(test_targets_df)
-
-    print(f"  Generating candidates for test S1 (Top-K={top_k})...")
-    test_candidates = generate_candidate_pairs(test_s1_df, test_index, top_k=top_k)
-
-    # Write output/candidate_pairs.tsv
-    cand_out_path = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
-    print(f"  Writing {cand_out_path}...")
-    with open(cand_out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter="\t")
-        writer.writerow(["source1_entity_id", "candidate_entity_ids"])
-        for s1_id in test_s1_df["entity_id"].values:
-            cands = test_candidates.get(s1_id, [])
-            writer.writerow([s1_id, ",".join(cands)])
-
-    # Predict test matches
-    print("  Extracting test features and scoring candidates...")
-    test_s1_dict = build_normalized_records_dict(test_s1_df)
-    test_target_dict = build_normalized_records_dict(test_targets_df)
-
-    test_pair_list = []
-    for s1_id, cands in test_candidates.items():
-        for c in cands:
-            test_pair_list.append((s1_id, c))
-
-    if test_pair_list:
-        X_test = compute_features_for_pairs(test_pair_list, test_s1_dict, test_target_dict)
-        test_probs = model.predict_proba(X_test)[:, 1]
-    else:
-        test_probs = np.array([])
-
-    test_accepted: Dict[str, List[str]] = {s1_id: [] for s1_id in test_s1_df["entity_id"].values}
-    for (s1_id, c), prob in zip(test_pair_list, test_probs):
-        if prob >= best_thresh:
-            test_accepted[s1_id].append(c)
-
-    # Write output/matching_results.tsv
-    match_out_path = os.path.join(OUTPUT_DIR, "matching_results.tsv")
-    print(f"  Writing {match_out_path}...")
-    with open(match_out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter="\t")
-        writer.writerow(["source1_entity_id", "matched_entity_ids"])
-        for s1_id in test_s1_df["entity_id"].values:
-            matches = test_accepted.get(s1_id, [])
-            writer.writerow([s1_id, ",".join(matches)])
-
-    # ------------------------------------------------------------------
-    # 6. Submission Validation Gate
-    # ------------------------------------------------------------------
-    print("\n[Step 6/6] Running Submission Validator...")
-    # For dry-run, we validate schema & format
-    if not dry_run:
-        is_valid = validate_submission(match_out_path, cand_out_path, test_dir)
-    else:
-        # Check basic schema on sample outputs
-        m_df = pd.read_csv(match_out_path, sep="\t", dtype=str, keep_default_na=False)
-        c_df = pd.read_csv(cand_out_path, sep="\t", dtype=str, keep_default_na=False)
-        is_valid = (
-            list(m_df.columns) == ["source1_entity_id", "matched_entity_ids"]
-            and list(c_df.columns) == ["source1_entity_id", "candidate_entity_ids"]
-            and len(m_df) == len(test_s1_df)
-            and len(c_df) == len(test_s1_df)
+        result = train_and_evaluate(
+            X_train, y_train, train_pair_ids,
+            X_val, y_val, val_pair_ids,
+            gt_matches, val_ids,
+            scale_pos_weight=spw,
+            model_out_path=model_out,
+            threshold_out_path=thresh_out,
         )
-        if is_valid:
-            print("\n  RESULT: PASS (Dry-run sample outputs valid!)")
+        model          = result['model']
+        best_threshold = result['best_threshold']
+        best_f05       = result['best_val_macro_f05']
+    else:
+        # Load cached model
+        with open(model_path or os.path.join(MODELS_DIR, 'lgbm_model.pkl'), 'rb') as f:
+            model = pickle.load(f)
+        with open(os.path.join(MODELS_DIR, 'threshold.json')) as f:
+            tdata = json.load(f)
+        best_threshold = tdata['best_threshold']
+        best_f05       = tdata['best_val_macro_f05']
 
-    log_submission_entry(
-        submission_name="phase1_baseline" + ("_dryrun" if dry_run else ""),
-        threshold=best_thresh,
-        val_f05=best_val_f05,
-        status="PASS" if is_valid else "FAIL",
-        notes=f"K={top_k}, dry_run={dry_run}",
+    # 7. Val predictions
+    val_probas = model.predict_proba(X_val)[:, 1]
+    val_preds  = {}
+    for (s1_id, tgt_id), prob in zip(val_pair_ids, val_probas):
+        if prob >= best_threshold:
+            val_preds.setdefault(s1_id, set()).add(tgt_id)
+    for s1_id in val_ids:
+        if s1_id not in val_preds:
+            val_preds[s1_id] = set()
+
+    gt_val = {k: v for k, v in gt_matches.items() if k in val_ids}
+    final_score = macro_f05(gt_val, val_preds, verbose=True)
+
+    elapsed = time.time() - t_total
+    print(f"\n  Total pipeline time: {elapsed:.0f}s")
+    print(f"  FINAL VAL MACRO F0.5: {final_score:.4f}")
+
+    # 8. Log experiment
+    _log_experiment({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'mode': 'train_val',
+        'K': K,
+        'scale_pos_weight': spw,
+        'val_blocking_recall': val_blocking['blocking_recall'],
+        'val_avg_candidates': val_blocking['avg_candidates'],
+        'val_macro_f05': final_score,
+        'threshold': best_threshold,
+        'notes': 'train_val run',
+    })
+
+    return model, best_threshold, final_score
+
+
+# ---------------------------------------------------------------------------
+# SUBMISSION mode: train on full training set, predict on test
+# ---------------------------------------------------------------------------
+
+def run_submission(K: int = 20, spw: float = 3.0, no_train: bool = False, model_path: str = None):
+    t_total = time.time()
+
+    print("\n" + "="*60)
+    print("  SUBMISSION MODE")
+    print("="*60)
+
+    # 1. Load data
+    data = load_all_data()
+    gt_matches = data['gt_matches']
+
+    # 2. Normalise
+    norm = normalise_all(data)
+
+    # Build lookups
+    train_s2_dict = build_lookup(norm['train_s2'])
+    train_s3_dict = build_lookup(norm['train_s3'])
+    test_s2_dict  = build_lookup(norm['test_s2'])
+    test_s3_dict  = build_lookup(norm['test_s3'])
+
+    train_target_dict = {**train_s2_dict, **train_s3_dict}
+    test_target_dict  = {**test_s2_dict, **test_s3_dict}
+
+    train_s1_dict = build_lookup(norm['train_s1'])
+    test_s1_dict  = build_lookup(norm['test_s1'])
+
+    # 3. Block for TRAIN (to get train features) and TEST
+    print("\n--- Blocking (train data, for model training) ---")
+    train_idx = BlockingIndex(norm['train_s2'], norm['train_s3'])
+    print("\n  Retrieving candidates for ALL TRAIN S1...")
+    train_candidates = train_idx.retrieve(norm['train_s1'], K=K)
+
+    print("\n--- Blocking (test data) ---")
+    test_idx = BlockingIndex(norm['test_s2'], norm['test_s3'])
+    print("\n  Retrieving candidates for ALL TEST S1...")
+    test_candidates = test_idx.retrieve(norm['test_s1'], K=K)
+
+    # Test blocking stats (no ground truth, but count candidates)
+    total_test_cands = sum(len(v) for v in test_candidates.values())
+    avg_test_cands   = total_test_cands / max(1, len(test_candidates))
+    print(f"\n  Test candidates — total: {total_test_cands:,}, avg per S1: {avg_test_cands:.1f}")
+
+    # 4. Feature matrices
+    print("\n--- Feature matrices ---")
+
+    print("  Train pairs (full training data)...")
+    X_train, y_train, train_pair_ids = build_feature_matrix(
+        train_candidates, train_s1_dict, train_target_dict, gt_matches
     )
+    print(f"  Train: {len(X_train):,} pairs, {y_train.sum():,} positives")
 
-    elapsed = time.time() - t_start
-    print(f"\nPipeline finished in {elapsed:.1f}s.")
-    return is_valid
+    print("  Test pairs...")
+    X_test, _, test_pair_ids = build_feature_matrix(
+        test_candidates, test_s1_dict, test_target_dict, gt_matches=None
+    )
+    print(f"  Test: {len(X_test):,} pairs")
 
+    # 5. Train on full training data (no val split — use tuned threshold from train_val)
+    if not no_train:
+        # Load threshold from train_val run
+        thresh_path = os.path.join(MODELS_DIR, 'threshold.json')
+        if os.path.exists(thresh_path):
+            with open(thresh_path) as f:
+                tdata = json.load(f)
+            threshold = tdata['best_threshold']
+            print(f"\n  Using saved threshold: {threshold:.3f}")
+        else:
+            threshold = 0.5
+            print(f"\n  No saved threshold found, using default: {threshold}")
+
+        model_out = os.path.join(MODELS_DIR, 'lgbm_model_submission.pkl')
+
+        # Train on full training data
+        import lightgbm as lgb
+        from src.trainer import LGB_PARAMS
+
+        params = {**LGB_PARAMS, 'scale_pos_weight': spw}
+        model = lgb.LGBMClassifier(n_estimators=LGB_PARAMS.get('n_estimators', 500), **{
+            k: v for k, v in LGB_PARAMS.items() if k != 'n_estimators'
+        }, scale_pos_weight=spw)
+
+        print(f"\n  Training on full training set ({len(X_train):,} pairs)...")
+        t_tr = time.time()
+        model.fit(X_train, y_train)
+        print(f"  Training done in {time.time()-t_tr:.1f}s")
+
+        with open(model_out, 'wb') as f:
+            pickle.dump(model, f)
+        print(f"  Submission model saved to: {model_out}")
+    else:
+        mp = model_path or os.path.join(MODELS_DIR, 'lgbm_model_submission.pkl')
+        with open(mp, 'rb') as f:
+            model = pickle.load(f)
+        with open(os.path.join(MODELS_DIR, 'threshold.json')) as f:
+            tdata = json.load(f)
+        threshold = tdata['best_threshold']
+
+    # 6. Predict
+    all_test_s1_ids = norm['test_s1']['entity_id'].tolist()
+    predictions = predict(model, X_test, test_pair_ids, threshold, all_test_s1_ids)
+
+    # 7. Write outputs
+    print("\n--- Writing output files ---")
+    write_outputs(predictions, test_candidates, all_test_s1_ids, OUTPUT_DIR)
+
+    elapsed = time.time() - t_total
+    print(f"\n  Total submission pipeline time: {elapsed:.0f}s")
+
+    # Log
+    _log_experiment({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'mode': 'submission',
+        'K': K,
+        'scale_pos_weight': spw,
+        'threshold': threshold,
+        'notes': 'submission run',
+    })
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 — Blocking experiment sweep
+# ---------------------------------------------------------------------------
+
+def run_phase2_blocking(K_values: list = None):
+    """
+    Phase 2.1: Systematic blocking experiment.
+    Sweeps K values and reports:
+      - blocking recall
+      - avg / max candidates
+    """
+    if K_values is None:
+        K_values = [10, 15, 20, 25, 30]
+
+    print("\n" + "="*60)
+    print("  PHASE 2 — Blocking Experiment Matrix")
+    print("="*60)
+
+    data = load_all_data()
+    gt_matches = data['gt_matches']
+    train_ids, val_ids = load_split_ids()
+    norm = normalise_all(data)
+
+    val_s1_df = norm['train_s1'][norm['train_s1']['entity_id'].isin(val_ids)].reset_index(drop=True)
+
+    print("\n--- Building blocking index ---")
+    idx = BlockingIndex(norm['train_s2'], norm['train_s3'])
+
+    results = []
+    report_path = os.path.join(BASE_DIR, 'reports', 'blocking_experiment.md')
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+    for K in K_values:
+        print(f"\n  --- K = {K} ---")
+        t0 = time.time()
+        val_cands = idx.retrieve(val_s1_df, K=K)
+        elapsed   = time.time() - t0
+
+        stats = blocking_stats(val_cands, gt_matches, val_ids)
+        stats['K'] = K
+        stats['retrieval_time_s'] = round(elapsed, 1)
+        results.append(stats)
+
+        print(f"  K={K}: recall={stats['blocking_recall']:.4f} "
+              f"avg_cands={stats['avg_candidates']:.1f} "
+              f"max_cands={stats['max_candidates']} "
+              f"time={elapsed:.1f}s")
+
+    # Write blocking report
+    lines = ["# Phase 2 — Blocking Experiment Report\n"]
+    lines.append("| K | Blocking Recall | Avg Candidates | Max Candidates | Time (s) |")
+    lines.append("|---|---|---|---|---|")
+    for r in results:
+        lines.append(
+            f"| {r['K']} | {r['blocking_recall']:.4f} | "
+            f"{r['avg_candidates']:.1f} | {r['max_candidates']} | {r['retrieval_time_s']} |"
+        )
+    lines.append("")
+    lines.append("## Recommendation")
+    good = [r for r in results if r['blocking_recall'] >= 0.90]
+    if good:
+        best = min(good, key=lambda x: x['avg_candidates'])
+        lines.append(f"\nRecommended K = **{best['K']}** "
+                     f"(recall={best['blocking_recall']:.4f}, avg_cands={best['avg_candidates']:.1f})")
+    else:
+        lines.append("\nBlocking recall below 0.90 for all K values tested. Consider relaxing blocking keys.")
+
+    report_text = '\n'.join(lines)
+    with open(report_path, 'w') as f:
+        f.write(report_text)
+    print(f"\n  Blocking report saved to: {report_path}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Experiment log helper
+# ---------------------------------------------------------------------------
+
+def _log_experiment(entry: dict):
+    fieldnames = [
+        'timestamp', 'mode', 'K', 'scale_pos_weight', 'val_blocking_recall',
+        'val_avg_candidates', 'val_macro_f05', 'threshold',
+        'leaderboard_score', 'notes'
+    ]
+    exists = os.path.exists(SUBMISSION_LOG)
+    with open(SUBMISSION_LOG, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        if not exists:
+            writer.writeheader()
+        writer.writerow(entry)
+    print(f"  Experiment logged to: {SUBMISSION_LOG}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Phase 1 End-to-End Pipeline")
-    parser.add_argument("--dry-run", action="store_true", help="Run fast dry-run on sample records")
-    parser.add_argument("--full", action="store_true", help="Run full pipeline on complete dataset")
-    parser.add_argument("--sample", type=int, default=None, help="Run on specific sample size")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-K candidates per S1 entity")
+    parser = argparse.ArgumentParser(description='Entity Resolution Pipeline')
+    parser.add_argument('--mode', choices=['train_val', 'submission', 'phase2_blocking', 'phase1_dryrun'],
+                        default='train_val')
+    parser.add_argument('--K', type=int, default=20,
+                        help='Top-K candidate cap (default: 20)')
+    parser.add_argument('--spw', type=float, default=3.0,
+                        help='LightGBM scale_pos_weight (default: 3.0)')
+    parser.add_argument('--no-train', action='store_true',
+                        help='Skip training, load cached model')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to cached model (used with --no-train)')
     args = parser.parse_args()
 
-    dry_run = args.dry_run or (not args.full and args.sample is None)
-    run_pipeline(dry_run=dry_run, sample_size=args.sample, top_k=args.top_k)
+    if args.mode == 'train_val':
+        run_train_val(K=args.K, spw=args.spw, no_train=args.no_train,
+                      model_path=args.model_path)
+
+    elif args.mode == 'submission':
+        run_submission(K=args.K, spw=args.spw, no_train=args.no_train,
+                       model_path=args.model_path)
+
+    elif args.mode == 'phase2_blocking':
+        run_phase2_blocking(K_values=[10, 15, 20, 25, 30])
+
+    elif args.mode == 'phase1_dryrun':
+        from src.phase1_pipeline import run_pipeline as run_phase1
+        run_phase1(dry_run=True, top_k=args.K)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

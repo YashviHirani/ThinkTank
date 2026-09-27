@@ -25,5 +25,12 @@ models/*.pkl
 models/*.joblib
 models/*.bin
 
+# Large experiment ID files
+experiments/train_s1_ids.txt
+experiments/val_s1_ids.txt
+
 # Generated submission TSVs (can exceed 100MB GitHub limit)
 output/*.tsv
+
+# Temp/scratch
+/tmp/

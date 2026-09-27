@@ -1,202 +1,368 @@
+#!/usr/bin/env python3
 """
-Submission Validator for Amazon ML Challenge 2026
-=================================================
-Validates the structural integrity and competition compliance of:
-  - output/matching_results.tsv
-  - output/candidate_pairs.tsv
+ML Challenge 2026 — Submission Validator
 
-Usage:
-    python utils/validate_submission.py \\
-      --matching output/matching_results.tsv \\
-      --candidate output/candidate_pairs.tsv \\
-      --test-dir dataset/test
+Run this BEFORE submitting. It checks your output files against every formatting
+rule the scorer enforces, so you can catch a rejection locally instead of burning
+a submission. It reads only your output files and the test source files (to learn
+which S1 entities are required and which S2/S3 IDs exist); it never needs the
+ground truth and never computes your score.
+
+It validates two files:
+
+* ``matching_results.tsv`` (required) — your final matches, the file scored on the
+  leaderboard.
+* ``candidate_pairs.tsv`` (optional) — the candidate set from your blocking stage.
+  When present, the validator also checks that your final matches are a subset of
+  your candidates and *warns* (never fails) otherwise. When absent it is skipped
+  with a warning; it is still expected in your final submission zip.
+
+Stdlib only, Python 3.8+. Run from the ``student_resource/`` directory::
+
+    python3 utils/validate_submission.py \
+        --matching output/matching_results.tsv \
+        --candidate output/candidate_pairs.tsv \
+        --test-dir dataset/test
+
+Exit code 0 means the files are safe to submit; 1 means fix the listed issues
+(warnings never fail the run).
+
+ID-existence check (off by default). By default the validator does NOT check that
+every matched/candidate ID actually exists in the test set: that check loads all
+Source-2/3 IDs into memory, which on the full ~1.7M-entity test set costs a few GB
+(more when ``candidate_pairs.tsv`` is included). The default run therefore stays fast
+and light and verifies every other rule; it prints a warning noting the check was
+skipped. Pass ``--check-ids`` to turn it on (it reads ``test_source2.tsv`` /
+``test_source3.tsv`` from ``--test-dir``); a missing/garbage matched ID only lowers
+your score rather than being rejected by the scorer, so this check is a diagnostic,
+not a gate. If ``--check-ids`` runs out of memory, drop ``--candidate`` (the candidate
+cross-check is the biggest memory user, and the matching file is the only one scored).
 """
 
+import argparse
 import os
 import sys
-import argparse
-import pandas as pd
+
+DELIM = "\t"
+MAX_EXAMPLES = 5  # how many offending IDs to show per issue
+MATCHING_HEADER = ["source1_entity_id", "matched_entity_ids"]
+CANDIDATE_HEADER = ["source1_entity_id", "candidate_entity_ids"]
 
 
-FORBIDDEN_EMPTY_STRINGS = {"[]", "none", "null", "nan", "undefined", "{}"}
+def read_ids(path):
+    """Return the set of first-column entity IDs from a source TSV.
 
-
-def parse_id_list(cell_value: str) -> list:
-    """Parses a comma-separated ID string into a clean list of IDs."""
-    if pd.isna(cell_value):
-        return []
-    s = str(cell_value).strip()
-    if not s:
-        return []
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-def validate_submission(
-    matching_path: str,
-    candidate_path: str,
-    test_dir: str,
-    verbose: bool = True,
-) -> bool:
+    The header row is skipped and blank lines are ignored.
     """
-    Validates submission files against all competition requirements.
-    Prints PASS and returns True if valid; prints errors and returns False otherwise.
+    with open(path, encoding="utf-8") as f:
+        next(f, None)  # skip header
+        return {line.split(DELIM, 1)[0].strip() for line in f if line.strip()}
+
+
+def examples(items):
+    """Return a short, human-readable sample of ``items`` for an error message."""
+    items = sorted(items)
+    shown = ", ".join(items[:MAX_EXAMPLES])
+    if len(items) > MAX_EXAMPLES:
+        return f"{len(items)} total, e.g. {shown}, ..."
+    return shown
+
+
+def load_match_targets(test_dir, warnings):
+    """Return the set of valid S2/S3 match IDs, or ``None`` if unavailable.
+
+    Only called when ``--check-ids`` is on. When ``test_source2.tsv`` or
+    ``test_source3.tsv`` is missing we cannot check that matched IDs exist, so we
+    record a warning and return ``None`` to signal that the existence check should be
+    skipped.
     """
-    def log(msg):
-        if verbose:
-            print(msg)
+    targets = set()
+    for name in ("test_source2.tsv", "test_source3.tsv"):
+        path = os.path.join(test_dir, name)
+        if not os.path.isfile(path):
+            warnings.append(
+                f"{path} not found — skipping the (optional) check that matched "
+                f"IDs exist in the test set. Every other rule is still checked. "
+                f"This is the lighter-memory mode; provide test_source2/3.tsv to "
+                f"enable the ID-existence check."
+            )
+            return None
+        targets |= read_ids(path)
+    return targets
 
-    log("\n" + "=" * 65)
-    log("  Amazon ML Challenge 2026 — Submission Validation Gate")
-    log("=" * 65)
 
-    # 1. Check file existence
-    if not os.path.exists(matching_path):
-        log(f"  [FAIL] Missing matching file: {matching_path}")
-        return False
-    if not os.path.exists(candidate_path):
-        log(f"  [FAIL] Missing candidate file: {candidate_path}")
-        return False
+def validate_id_list_file(path, expected_header, col_label, required, valid_ids, errors):
+    """Validate one results-style TSV (matching or candidate).
 
-    s1_test_path = os.path.join(test_dir, "test_source1.tsv")
-    s2_test_path = os.path.join(test_dir, "test_source2.tsv")
-    s3_test_path = os.path.join(test_dir, "test_source3.tsv")
+    Applies the shared formatting rules and appends any problems to ``errors``.
+    Returns a ``{source1_id: set(matched/candidate ids)}`` mapping, or ``None`` on a
+    fatal problem (missing file, empty file, or a broken header) that stops parsing.
+    """
+    if not os.path.isfile(path):
+        errors.append(f"File not found: {path}")
+        return None
 
-    for p in [s1_test_path, s2_test_path, s3_test_path]:
-        if not os.path.exists(p):
-            log(f"  [FAIL] Missing reference test file: {p}")
-            return False
+    name = os.path.basename(path)
+    mapping = {}
+    seen, dup_rows, intra_dupes = set(), set(), set()
+    self_matches, wrong_prefix, unknown = set(), set(), set()
+    n_rows = empties = 0
 
-    # 2. Load ground-truth test S1 IDs
-    log("  Loading test source1 entities...")
-    test_s1_df = pd.read_csv(s1_test_path, sep="\t", dtype=str, usecols=["entity_id"])
-    expected_s1_ids = set(test_s1_df["entity_id"])
-    n_expected = len(expected_s1_ids)
-    log(f"    Expected test S1 entities: {n_expected:,}")
+    with open(path, encoding="utf-8") as f:
+        header = f.readline()
+        if not header:
+            errors.append(f"{name} is empty.")
+            return None
+        if DELIM not in header and "," in header:  # the #1 mistake: a CSV
+            errors.append(
+                f"{name}: header has no TAB but contains commas — the file looks "
+                "COMMA-separated. Submissions must be TAB-separated (.tsv); "
+                "write it with df.to_csv(sep='\\t', index=False)."
+            )
+            return None
+        cols = [c.strip().lower() for c in header.rstrip("\n").split(DELIM)]
+        if cols != expected_header:
+            errors.append(
+                f"{name}: unexpected header {cols}. "
+                f"Expected exactly {expected_header} (tab-separated)."
+            )
+            return None
 
-    # 3. Validate matching_results.tsv schema
-    log("\n  Validating matching_results.tsv...")
-    match_df = pd.read_csv(matching_path, sep="\t", dtype=str, keep_default_na=False)
-    expected_match_cols = ["source1_entity_id", "matched_entity_ids"]
-    if list(match_df.columns) != expected_match_cols:
-        log(f"  [FAIL] Invalid headers in {matching_path}. Got: {list(match_df.columns)}, expected: {expected_match_cols}")
-        return False
-
-    if len(match_df) != n_expected:
-        log(f"  [FAIL] Row count mismatch in matching_results.tsv! Got: {len(match_df):,}, expected: {n_expected:,}")
-        return False
-
-    match_s1_ids = set(match_df["source1_entity_id"])
-    if match_s1_ids != expected_s1_ids:
-        missing = expected_s1_ids - match_s1_ids
-        extra = match_s1_ids - expected_s1_ids
-        log(f"  [FAIL] S1 IDs mismatch in matching_results.tsv! Missing: {len(missing):,}, Extra: {len(extra):,}")
-        return False
-
-    # 4. Validate candidate_pairs.tsv schema
-    log("  Validating candidate_pairs.tsv...")
-    cand_df = pd.read_csv(candidate_path, sep="\t", dtype=str, keep_default_na=False)
-    expected_cand_cols = ["source1_entity_id", "candidate_entity_ids"]
-    if list(cand_df.columns) != expected_cand_cols:
-        log(f"  [FAIL] Invalid headers in {candidate_path}. Got: {list(cand_df.columns)}, expected: {expected_cand_cols}")
-        return False
-
-    if len(cand_df) != n_expected:
-        log(f"  [FAIL] Row count mismatch in candidate_pairs.tsv! Got: {len(cand_df):,}, expected: {n_expected:,}")
-        return False
-
-    cand_s1_ids = set(cand_df["source1_entity_id"])
-    if cand_s1_ids != expected_s1_ids:
-        missing = expected_s1_ids - cand_s1_ids
-        extra = cand_s1_ids - expected_s1_ids
-        log(f"  [FAIL] S1 IDs mismatch in candidate_pairs.tsv! Missing: {len(missing):,}, Extra: {len(extra):,}")
-        return False
-
-    # 5. Check cell formatting (no literal "[]", "NaN", "None")
-    log("  Checking singleton cell formatting...")
-    for name, df, col in [
-        ("matching_results.tsv", match_df, "matched_entity_ids"),
-        ("candidate_pairs.tsv", cand_df, "candidate_entity_ids"),
-    ]:
-        bad_entries = df[df[col].str.lower().isin(FORBIDDEN_EMPTY_STRINGS)]
-        if len(bad_entries) > 0:
-            log(f"  [FAIL] Found forbidden string representation for singletons in {name} (e.g. {bad_entries[col].iloc[0]!r})")
-            return False
-
-    # 6. Check duplicate IDs within single cells & prefix validation
-    log("  Checking ID prefixes and within-cell uniqueness...")
-    for name, df, col in [
-        ("matching_results.tsv", match_df, "matched_entity_ids"),
-        ("candidate_pairs.tsv", cand_df, "candidate_entity_ids"),
-    ]:
-        for idx, row in df.iterrows():
-            val = row[col].strip()
-            if not val:
+        for line_num, line in enumerate(f, start=2):
+            s1, tab, rest = line.partition(DELIM)
+            if not tab:
+                if s1.strip():
+                    errors.append(
+                        f"{name}: malformed row (no tab) at line {line_num}: "
+                        f"{line.rstrip()!r}"
+                    )
                 continue
-            ids = [x.strip() for x in val.split(",") if x.strip()]
+
+            n_rows += 1
+            if s1 in seen:
+                dup_rows.add(s1)
+            seen.add(s1)
+
+            ids = rest.rstrip("\n").split(",") if rest.strip() else []
+            if not ids:
+                empties += 1
+                mapping[s1] = set()
+                continue
             if len(ids) != len(set(ids)):
-                log(f"  [FAIL] Duplicate IDs inside {name} for {row['source1_entity_id']}: {val}")
-                return False
-            for target_id in ids:
-                if not (target_id.startswith("S2-") or target_id.startswith("S3-")):
-                    log(f"  [FAIL] Invalid ID prefix in {name}: {target_id} (must be S2- or S3-)")
-                    return False
+                intra_dupes.add(s1)
+            id_set = set(ids)
+            mapping[s1] = id_set
+            for mid in id_set:
+                if mid.startswith("S1-"):
+                    self_matches.add(mid)
+                elif not mid.startswith(("S2-", "S3-")):
+                    wrong_prefix.add(mid)
+                elif valid_ids is not None and mid not in valid_ids:
+                    unknown.add(mid)
 
-    # 7. Check candidate containment: every match must be in candidates
-    log("  Checking candidate containment (all matches in candidate list)...")
-    cand_dict = dict(zip(cand_df["source1_entity_id"], cand_df["candidate_entity_ids"]))
+    # Aggregate the per-category findings. Each entry is (offenders, message);
+    # only non-empty categories become errors.
+    findings = [
+        (
+            dup_rows,
+            "{name}: duplicate source1_entity_id row(s): {ex}. "
+            "Each S1 entity may appear on only one row.",
+        ),
+        (
+            intra_dupes,
+            "{name}: repeated ID inside a {col} list for: {ex}. "
+            "No duplicate IDs are allowed within a list.",
+        ),
+        (
+            self_matches,
+            "{name}: {col} contains Source-1 IDs (self-matches): {ex}. "
+            "Only S2-/S3- IDs are allowed.",
+        ),
+        (
+            wrong_prefix,
+            "{name}: {col} contains IDs without an S2-/S3- prefix: {ex}.",
+        ),
+        (
+            unknown,
+            "{name}: {col} references IDs not in the test "
+            "Source-2/3 files: {ex}.",
+        ),
+        (
+            required - seen,
+            "{name}: required S1 entity(ies) missing: {ex}. "
+            "Every entity in test_source1.tsv needs a row (empty = no match).",
+        ),
+        (
+            seen - required,
+            "{name}: row(s) using an S1 ID that is not in the test set: {ex}.",
+        ),
+    ]
+    for offenders, message in findings:
+        if offenders:
+            errors.append(message.format(name=name, ex=examples(offenders), col=col_label))
 
-    containment_errors = 0
-    for _, row in match_df.iterrows():
-        s1_id = row["source1_entity_id"]
-        matches = parse_id_list(row["matched_entity_ids"])
-        if not matches:
-            continue
-        cands = set(parse_id_list(cand_dict.get(s1_id, "")))
-        uncontained = set(matches) - cands
-        if uncontained:
-            if containment_errors < 3:
-                log(f"  [FAIL] Matches not in candidates for {s1_id}: {uncontained}")
-            containment_errors += 1
+    print(f"  {name}: {n_rows} rows ({empties} empty, {n_rows - empties} non-empty).")
+    return mapping
 
-    if containment_errors > 0:
-        log(f"  [FAIL] Found {containment_errors:,} S1 entities where predicted matches are missing from candidate_pairs.tsv")
-        return False
 
-    # 8. Check target ID existence against test_source2 and test_source3
-    log("  Checking target ID existence in test source2/3...")
-    test_s2_df = pd.read_csv(s2_test_path, sep="\t", dtype=str, usecols=["entity_id"])
-    test_s3_df = pd.read_csv(s3_test_path, sep="\t", dtype=str, usecols=["entity_id"])
-    valid_target_ids = set(test_s2_df["entity_id"]) | set(test_s3_df["entity_id"])
+def validate(matching_path, candidate_path, test_dir, check_ids=False):
+    """Validate the submission output(s); return ``(errors, warnings)`` lists.
 
-    # Sample check of predicted matches
-    all_predicted_matches = set()
-    for val in match_df["matched_entity_ids"].values:
-        if val:
-            all_predicted_matches.update(parse_id_list(val))
+    ``check_ids`` (``--check-ids``) turns on the optional, memory-heavy check that
+    every matched/candidate ID exists in the test Source-2/3 files. It is off by
+    default so the common run stays fast and light.
+    """
+    errors, warnings = [], []
 
-    log(f"    Total distinct predicted matches: {len(all_predicted_matches):,}")
-    invalid_targets = all_predicted_matches - valid_target_ids
-    if invalid_targets:
-        log(f"  [FAIL] {len(invalid_targets):,} predicted IDs do not exist in test_source2 or test_source3! (e.g. {list(invalid_targets)[:3]})")
-        return False
+    source1 = os.path.join(test_dir, "test_source1.tsv")
+    if not os.path.isfile(source1):
+        errors.append(f"Test source1 file not found: {source1} (check --test-dir).")
+        return errors, warnings
+    required = read_ids(source1)
+    print(f"  required S1 entities: {len(required)}")
 
-    log("\n" + "=" * 65)
-    log("  RESULT: PASS")
-    log("  All format, schema, prefix, and containment checks PASSED [OK]")
-    log("=" * 65 + "\n")
-    return True
+    if check_ids:
+        valid_ids = load_match_targets(test_dir, warnings)
+        if valid_ids is not None:
+            print(f"  valid S2/S3 match IDs: {len(valid_ids)}")
+    else:
+        valid_ids = None
+        warnings.append(
+            "ID-existence check is OFF (the default) — not checking that matched/"
+            "candidate IDs exist in the test set. Every other rule is still checked. "
+            "Re-run with --check-ids to enable it (needs test_source2/3.tsv; uses "
+            "more memory). A nonexistent ID only lowers your score, never rejects "
+            "your submission."
+        )
+
+    matched = validate_id_list_file(
+        matching_path, MATCHING_HEADER, "matched_entity_ids", required, valid_ids, errors
+    )
+
+    # candidate_pairs.tsv is optional: if it's absent we skip its checks with a
+    # warning (it's still expected in your final submission zip). A missing
+    # candidate file never fails this run on its own.
+    candidate = None
+    if candidate_path and os.path.isfile(candidate_path):
+        candidate = validate_id_list_file(
+            candidate_path, CANDIDATE_HEADER, "candidate_entity_ids",
+            required, valid_ids, errors,
+        )
+    elif candidate_path:
+        warnings.append(
+            f"{candidate_path} not found — skipping candidate_pairs.tsv checks. "
+            "It is optional here, but your final submission zip must include "
+            "output/candidate_pairs.tsv."
+        )
+
+    # Soft check: your final matches should come from your blocking candidates.
+    # A matched ID absent from candidate_pairs.tsv usually means a pipeline bug,
+    # so we warn but never fail on it.
+    if matched is not None and candidate is not None:
+        offenders = {
+            s1 for s1, mids in matched.items() if mids - candidate.get(s1, set())
+        }
+        if offenders:
+            warnings.append(
+                f"{len(offenders)} S1 entity(ies) have matched IDs not present in "
+                f"candidate_pairs.tsv, e.g. {examples(offenders)}. Final matches "
+                "normally come from your blocking candidates — double-check these."
+            )
+
+    return errors, warnings
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate Amazon ML Challenge submission files")
-    parser.add_argument("--matching", required=True, help="Path to matching_results.tsv")
-    parser.add_argument("--candidate", required=True, help="Path to candidate_pairs.tsv")
-    parser.add_argument("--test-dir", required=True, help="Path to dataset/test directory")
+    parser = argparse.ArgumentParser(
+        description="Validate ML Challenge 2026 submission output files before submitting."
+    )
+    parser.add_argument(
+        "--matching",
+        "-m",
+        default="output/matching_results.tsv",
+        help="Path to matching_results.tsv (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--candidate",
+        "-c",
+        default=None,
+        help="Path to candidate_pairs.tsv "
+        "(default: output/candidate_pairs.tsv if it exists).",
+    )
+    parser.add_argument(
+        "--test-dir",
+        "-t",
+        default="dataset/test",
+        help="Folder with test_source1/2/3.tsv (default: %(default)s). "
+        "test_source2/3.tsv are only read when --check-ids is given.",
+    )
+    parser.add_argument(
+        "--check-ids",
+        action="store_true",
+        help="Also check that every matched/candidate ID exists in the test "
+        "Source-2/3 files. Off by default (loads all S2/S3 IDs into memory — a few "
+        "GB on the full test set). A nonexistent ID only lowers your score, so this "
+        "is a diagnostic, not a submission gate.",
+    )
     args = parser.parse_args()
 
-    success = validate_submission(args.matching, args.candidate, args.test_dir)
-    sys.exit(0 if success else 1)
+    # candidate_pairs.tsv is optional; default to the conventional path and let
+    # validate() skip (with a warning) if the file isn't there.
+    candidate_path = args.candidate or "output/candidate_pairs.tsv"
+
+    print("ML Challenge 2026 — submission validator")
+    print(f"  test dir: {args.test_dir}")
+    try:
+        errors, warnings = validate(
+            args.matching, candidate_path, args.test_dir, check_ids=args.check_ids
+        )
+    except UnicodeDecodeError:
+        print()
+        print("FAIL — 1 issue(s) to fix before submitting:")
+        print(
+            f"  1. A file is not valid UTF-8 text (most likely {args.matching} or "
+            f"{candidate_path}). Re-save it as a plain UTF-8, tab-separated .tsv — "
+            "not cp1252/Latin-1, and not a compressed or binary file (.gz/.xlsx/"
+            ".parquet) renamed to .tsv. In pandas: "
+            "df.to_csv(path, sep='\\t', index=False, encoding='utf-8')."
+        )
+        return 1
+    except OSError as exc:
+        print()
+        print("FAIL — 1 issue(s) to fix before submitting:")
+        print(f"  1. Could not read a file: {exc}.")
+        return 1
+
+    print()
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    if errors:
+        print(f"FAIL — {len(errors)} issue(s) to fix before submitting:")
+        for i, error in enumerate(errors, 1):
+            print(f"  {i}. {error}")
+        return 1
+    print("PASS — no blocking issues found. Safe to submit.")
+    return 0
+
+
+def validate_submission(matching_path: str, candidate_path: str, test_dir: str, verbose: bool = True) -> bool:
+    """Convenience wrapper for pipeline orchestrators."""
+    try:
+        errors, warnings = validate(matching_path, candidate_path, test_dir, check_ids=False)
+        if verbose:
+            for w in warnings:
+                print(f"WARNING: {w}")
+            if errors:
+                for i, err in enumerate(errors, 1):
+                    print(f"  {i}. {err}")
+            else:
+                print("PASS — no blocking issues found. Safe to submit.")
+        return len(errors) == 0
+    except Exception as exc:
+        if verbose:
+            print(f"Validation error: {exc}")
+        return False
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
