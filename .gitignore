@@ -24,3 +24,13 @@ Thumbs.db
 models/*.pkl
 models/*.joblib
 models/*.bin
+
+# Large experiment ID files
+experiments/train_s1_ids.txt
+experiments/val_s1_ids.txt
+
+# Output TSV files (submitted separately)
+output/*.tsv
+
+# Temp/scratch
+/tmp/
