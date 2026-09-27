@@ -1,0 +1,26 @@
+# Dataset files (too large for git)
+dataset/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Models (binary artifacts)
+models/*.pkl
+models/*.joblib
+models/*.bin
