@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
 **Team Name:** ThinkTank  
-**Team Members:** Yashvi Hirani  
+**Team Members:** Yashvi Hirani, Mihir Rathod, Tirth Patel      
 **Submission Date:** 27 September 2026  
 
 ---
