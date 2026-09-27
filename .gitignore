@@ -24,3 +24,6 @@ Thumbs.db
 models/*.pkl
 models/*.joblib
 models/*.bin
+
+# Generated submission TSVs (can exceed 100MB GitHub limit)
+output/*.tsv

@@ -1,0 +1,4 @@
+timestamp,submission_name,threshold,val_macro_f05,status,notes
+2026-09-27T08:21:43.239631+00:00,phase1_baseline_dryrun,0.35,1.0000,PASS,"K=20, dry_run=True"
+2026-09-27T08:23:13.848749+00:00,phase1_baseline_dryrun,0.35,0.9222,PASS,"K=20, dry_run=True"
+2026-09-27T08:31:13.721717+00:00,phase1_baseline_dryrun,0.35,0.9222,PASS,"K=20, dry_run=True"
